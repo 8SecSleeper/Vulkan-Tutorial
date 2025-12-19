@@ -1,0 +1,174 @@
+name: SimpleEngine CI
+
+on:
+  push:
+    paths:
+      - 'attachments/simple_engine/**'
+      - '.github/workflows/simple_engine_ci.yml'
+  pull_request:
+    paths:
+      - 'attachments/simple_engine/**'
+      - '.github/workflows/simple_engine_ci.yml'
+  workflow_dispatch:
+
+jobs:
+  desktop:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    defaults:
+      run:
+        working-directory: attachments/simple_engine
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC dev environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Ninja
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            throw "Chocolatey is required on windows-latest runners"
+          }
+
+          if (Test-Path "C:\VulkanSDK") {
+            Write-Host "Using existing Vulkan SDK at C:\VulkanSDK"
+          } else {
+            Write-Host "Downloading Vulkan SDK installer..."
+            choco install -y aria2
+            $installer = Join-Path $env:TEMP "vulkan-sdk.exe"
+            aria2c --split=8 --max-connection-per-server=8 --min-split-size=1M --dir="$env:TEMP" --out="vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe"
+
+            Write-Host "Installing Vulkan SDK (silent, default feature set)..."
+            # NOTE: Do not pass --components here. LunarG has changed component IDs over time,
+            # and specifying them can cause 'Component(s) not found' failures.
+            Start-Process -FilePath $installer -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait -NoNewWindow
+          }
+
+          $vulkanPath = ""
+          if (Test-Path "C:\VulkanSDK") {
+            $vulkanPath = Get-ChildItem "C:\VulkanSDK" | Sort-Object -Property Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $vulkanPath) {
+            throw "Vulkan SDK not found after install"
+          }
+
+          "VULKAN_SDK=$vulkanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vulkanPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CMAKE_PREFIX_PATH=$vulkanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_INCLUDE_DIR=$vulkanPath\Include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_LIBRARY=$vulkanPath\Lib\vulkan-1.lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates xz-utils
+
+          echo "Downloading Vulkan SDK from LunarG..."
+          # Use the official LunarG download endpoint (latest Linux tarball).
+          SDK_TGZ="${RUNNER_TEMP}/vulkansdk-linux.tar.xz"
+
+          download_ok=0
+          for url in \
+            "https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz" \
+            "https://sdk.lunarg.com/sdk/download/latest/linux/vulkansdk-linux-x86_64.tar.xz" \
+            "https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz?Human=true" \
+            "https://sdk.lunarg.com/sdk/download/latest/linux/vulkansdk-linux-x86_64.tar.xz?Human=true"
+          do
+            echo "Attempting: $url"
+            if curl -L --fail -o "$SDK_TGZ" "$url"; then
+              download_ok=1
+              break
+            fi
+          done
+          if [ "$download_ok" -ne 1 ]; then
+            echo "Failed to download Vulkan SDK from LunarG (all endpoints returned non-200)." >&2
+            exit 1
+          fi
+
+          SDK_DIR="${RUNNER_TEMP}/VulkanSDK"
+          rm -rf "$SDK_DIR"
+          mkdir -p "$SDK_DIR"
+          tar -xJf "$SDK_TGZ" -C "$SDK_DIR"
+
+          # The tarball extracts into a versioned subdirectory.
+          VULKAN_SDK_PATH="$(find "$SDK_DIR" -maxdepth 1 -type d -name '1.*' | sort -r | head -n 1)"
+          if [ -z "${VULKAN_SDK_PATH:-}" ]; then
+            echo "Failed to locate extracted Vulkan SDK directory under $SDK_DIR" >&2
+            exit 1
+          fi
+
+          echo "VULKAN_SDK=$VULKAN_SDK_PATH" >> "$GITHUB_ENV"
+          echo "$VULKAN_SDK_PATH/bin" >> "$GITHUB_PATH"
+          echo "CMAKE_PREFIX_PATH=$VULKAN_SDK_PATH" >> "$GITHUB_ENV"
+
+      # Use the engine's dependency install scripts instead of calling vcpkg directly in CI.
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+          if (-not (Test-Path $vcpkgRoot)) {
+            git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+          }
+          Push-Location $vcpkgRoot
+          .\bootstrap-vcpkg.bat
+          Pop-Location
+
+          "VCPKG_INSTALLATION_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vcpkgRoot" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CMAKE_TOOLCHAIN_FILE=$vcpkgRoot\scripts\buildsystems\vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call install_dependencies_windows.bat
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          chmod +x ./install_dependencies_linux.sh
+          ./install_dependencies_linux.sh
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$env:CMAKE_TOOLCHAIN_FILE"
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target SimpleEngine --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
